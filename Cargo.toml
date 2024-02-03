@@ -1,0 +1,16 @@
+[package]
+name = "aws-ecr-scan-detail"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+overflow-checks = false
+incremental = false
+opt-level = 3  # Enable aggressive optimizations for release builds
+debug = false  # Strip debug symbols from the binary
+lto = true  
+
+[dependencies]
+aws-config = { version = "1.1.4", features = ["behavior-version-latest"] }
+aws-sdk-ecr = "1.12.0"
+tokio = { version = "1.36.0", features = ["full"] }
