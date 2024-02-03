@@ -9,6 +9,7 @@ incremental = false
 opt-level = 3  # Enable aggressive optimizations for release builds
 debug = false  # Strip debug symbols from the binary
 lto = true  
+strip = "symbols"
 
 [dependencies]
 aws-config = { version = "1.1.4", features = ["behavior-version-latest"] }

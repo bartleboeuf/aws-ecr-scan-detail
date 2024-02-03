@@ -17,7 +17,7 @@ $> export AWS_PROFILE=myAwsProfileName
 $> aws-ecr-scan-detail --all
 ```
 
-Scan a sigle repository :
+Scan a single repository :
 
 ```Shell
 $> aws-ecr-scan-detail name-of-ecr-repository
@@ -89,6 +89,7 @@ incremental = false # Disable creation of incremental info https://doc.rust-lang
 opt-level = 3  # Enable aggressive optimizations for release builds https://doc.rust-lang.org/cargo/reference/profiles.html#opt-level
 debug = false  # Strip debug symbols from the binary https://doc.rust-lang.org/cargo/reference/profiles.html#debug
 lto = true # Enable better optimizations https://doc.rust-lang.org/cargo/reference/profiles.html#lto
+strip = "symbols" # Strip symbols from binary https://doc.rust-lang.org/cargo/reference/profiles.html#strip
 ```
 
 By adding some arguments to the Rust linker, I was able to reduce consumption.
