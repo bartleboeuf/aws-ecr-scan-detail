@@ -1,11 +1,14 @@
 use aws_sdk_ecr::primitives::{DateTime, DateTimeFormat};
-use aws_sdk_ecr::types::FindingSeverity;
+use aws_sdk_ecr::types::builders::ImageIdentifierBuilder;
+use aws_sdk_ecr::types::{FindingSeverity, ScanType};
 use aws_sdk_ecr::Client;
 use std::env;
 
 async fn list_all_repositories(
     client: &aws_sdk_ecr::Client, // Client for interacting with AWS ECR
-) -> Result<(), Box<dyn std::error::Error>> { // Result indicating success or failure with an error type
+    scan_type: &ScanType,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Result indicating success or failure with an error type
     // List all repositories
     let response = match client.describe_repositories().send().await {
         Ok(response) => response, // If successful, store the response
@@ -27,7 +30,7 @@ async fn list_all_repositories(
         };
 
         // List images in the current repository
-        match list_images_in_repository(client, &repository_name).await {
+        match list_images_in_repository(client, &repository_name, scan_type).await {
             Ok(_) => {} // No need to do anything if successful
             Err(e) => {
                 eprintln!(
@@ -42,12 +45,13 @@ async fn list_all_repositories(
     Ok(())
 }
 
-
 // Function to list images in a repository
 async fn list_images_in_repository(
     client: &aws_sdk_ecr::Client, // Client for interacting with AWS ECR
-    repository_name: &str, // Name of the repository to list images from
-) -> Result<(), aws_sdk_ecr::Error> { // Result indicating success or failure with the AWS ECR error type
+    repository_name: &str,        // Name of the repository to list images from
+    scan_type: &ScanType,
+) -> Result<(), aws_sdk_ecr::Error> {
+    // Result indicating success or failure with the AWS ECR error type
     // Create a request to describe images in the repository
     let request = client.describe_images().repository_name(repository_name);
     // Send the request and await the response, handling any potential errors
@@ -62,46 +66,61 @@ async fn list_images_in_repository(
             if media_type == "application/vnd.docker.container.image.v1+json" {
                 // Extract necessary information about the image
                 let repository_name = image_detail.repository_name.unwrap_or_default();
-                let image_tag = image_detail.image_tags.unwrap_or_default();
+                let image_tags = image_detail.image_tags.unwrap_or_default();
                 let image_digest = image_detail.image_digest.unwrap_or_default();
                 // Print basic image information
                 print!(
                     "{};{};{}",
                     repository_name,
-                    image_tag.first().map_or("", |t| t.as_str()), // Use the first tag if available
+                    image_tags.first().map_or("", |t| t.as_str()), // Use the first tag if available
                     image_digest
                 );
-
-                // Check if image scan findings are available
-                if let Some(findings) = image_detail.image_scan_findings_summary {
-                    // Extract and format relevant scan and vulnerability update dates
-                    let scan_complete_date =
-                        findings.image_scan_completed_at.unwrap_or(default_date);
-                    let update_scan_date = findings
-                        .vulnerability_source_updated_at
-                        .unwrap_or(default_date);
-                    // Extract and print severity counts for different vulnerability levels
-                    let severity_map = findings.finding_severity_counts.unwrap_or_default();
-                    println!(
-                        ";{};{};{};{};{};{};{};{}",
-                        scan_complete_date
-                            .fmt(DateTimeFormat::DateTime)
-                            .unwrap_or_default(),
-                        update_scan_date
-                            .fmt(DateTimeFormat::DateTime)
-                            .unwrap_or_default(),
-                        severity_map.get(&FindingSeverity::Critical).unwrap_or(&0),
-                        severity_map.get(&FindingSeverity::High).unwrap_or(&0),
-                        severity_map.get(&FindingSeverity::Medium).unwrap_or(&0),
-                        severity_map.get(&FindingSeverity::Low).unwrap_or(&0),
-                        severity_map
-                            .get(&FindingSeverity::Informational)
-                            .unwrap_or(&0),
-                        severity_map.get(&FindingSeverity::Undefined).unwrap_or(&0)
-                    );
+                // If registry use Basic Scan
+                if scan_type.as_str() == ScanType::Basic.as_str() {
+                    // Check if image scan findings are available
+                    if let Some(findings) = image_detail.image_scan_findings_summary {
+                        // Extract and format relevant scan and vulnerability update dates
+                        let scan_complete_date =
+                            findings.image_scan_completed_at.unwrap_or(default_date);
+                        let update_scan_date = findings
+                            .vulnerability_source_updated_at
+                            .unwrap_or(default_date);
+                        // Extract and print severity counts for different vulnerability levels
+                        let severity_map = findings.finding_severity_counts.unwrap_or_default();
+                        print_results(scan_complete_date, update_scan_date, severity_map);
+                    } else {
+                        // If no scan findings are available, print placeholders for severity counts
+                        println!(";;;0;0;0;0;0;0");
+                    }
                 } else {
-                    // If no scan findings are available, print placeholders for severity counts
-                    println!(";;;0;0;0;0;0;0");
+                    // Enhanced scan
+                    // Create image identifier based on image digest
+                    let image_identifier = ImageIdentifierBuilder::default()
+                        .image_digest(image_digest)
+                        .build();
+                    // Request image findings for image digest
+                    let request_scan = client
+                        .describe_image_scan_findings()
+                        .registry_id(image_detail.registry_id.unwrap())
+                        .repository_name(repository_name)
+                        .image_id(image_identifier);
+                    // Send the request and await the response, handling any potential errors
+                    let response_scan = request_scan.send().await?;
+
+                    if let Some(findings) = response_scan.image_scan_findings {
+                        // Extract and print severity counts for different vulnerability levels
+                        let severity_map = findings.finding_severity_counts.unwrap_or_default();
+                        let scan_complete_date =
+                            findings.image_scan_completed_at.unwrap_or(default_date);
+                        let update_scan_date = findings
+                            .vulnerability_source_updated_at
+                            .unwrap_or(default_date);
+                        // Print results
+                        print_results(scan_complete_date, update_scan_date, severity_map)
+                    } else {
+                        // If no scan findings are available, print placeholders for severity counts
+                        println!(";;;0;0;0;0;0;0");
+                    }
                 }
             }
         }
@@ -109,6 +128,30 @@ async fn list_images_in_repository(
     Ok(())
 }
 
+// Print severity and dates in csv line
+fn print_results(
+    scan_complete_date: DateTime,
+    update_scan_date: DateTime,
+    severity_map: std::collections::HashMap<FindingSeverity, i32>,
+) {
+    println!(
+        ";{};{};{};{};{};{};{};{}",
+        scan_complete_date
+            .fmt(DateTimeFormat::DateTime)
+            .unwrap_or_default(),
+        update_scan_date
+            .fmt(DateTimeFormat::DateTime)
+            .unwrap_or_default(),
+        severity_map.get(&FindingSeverity::Critical).unwrap_or(&0),
+        severity_map.get(&FindingSeverity::High).unwrap_or(&0),
+        severity_map.get(&FindingSeverity::Medium).unwrap_or(&0),
+        severity_map.get(&FindingSeverity::Low).unwrap_or(&0),
+        severity_map
+            .get(&FindingSeverity::Informational)
+            .unwrap_or(&0),
+        severity_map.get(&FindingSeverity::Undefined).unwrap_or(&0)
+    );
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -129,7 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Check if the user wants to process all repositories
     let process_all = args.contains(&String::from("--all"));
-    
+
     // Check if repository name argument is provided
     let repository_name = if process_all {
         None
@@ -145,9 +188,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "repository_name;image_tags;image_digest;image_scan_completed_date;vulnerability_source_updated_date;Critical;High;Medium;Low;Informational;Undefined"
     );
 
+    // Get ECR Scan type
+    // Create a request to describe images in the repository
+    let request = client.get_registry_scanning_configuration();
+    // Send the request and await the response, handling any potential errors
+    let response = request.send().await?;
+    // Get Scan type from registry config
+    let binding = response.scanning_configuration.unwrap();
+    let scan_type = binding.scan_type().unwrap();
+
     // Check if a repository name is provided and list images in that repository
     if let Some(repo) = repository_name {
-        match list_images_in_repository(&client, repo).await {
+        match list_images_in_repository(&client, repo, scan_type).await {
             Ok(_) => {} // No need to do anything if successful
             Err(e) => {
                 eprintln!("Error listing images for repository '{}': {}", repo, e);
@@ -156,7 +208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         // If no repository name is provided, list all repositories
-        match list_all_repositories(&client).await {
+        match list_all_repositories(&client, scan_type).await {
             Ok(_) => {} // No need to do anything if successful
             Err(e) => {
                 eprintln!("Error listing all repositories: {}", e);
@@ -165,5 +217,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    Ok(()) 
+    Ok(())
 }
