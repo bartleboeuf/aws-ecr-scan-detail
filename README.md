@@ -1,7 +1,7 @@
 # AWS ECR SCAN REPORT to CSV
 
 This is my first rust crate based on a simple use case. I need to extract the details of the AWS ECR repositories vulnerabilities scan report, and create a CSV output.
-Current version will only work with ECR "Basic" scan level. Later, I will try to implement report from "Enhanced" scan level. 
+Current version will work with ECR "Basic" and "Enhanced" scan level.
 
 ## Getting started
 
