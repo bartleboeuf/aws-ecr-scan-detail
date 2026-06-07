@@ -1,126 +1,223 @@
+use aws_sdk_ecr::Client;
 use aws_sdk_ecr::primitives::{DateTime, DateTimeFormat};
 use aws_sdk_ecr::types::builders::ImageIdentifierBuilder;
 use aws_sdk_ecr::types::{FindingSeverity, ScanType};
-use aws_sdk_ecr::Client;
+use futures::future::join_all;
+use std::collections::HashMap;
 use std::env;
 
+/// Iterate all repositories in the AWS account and fetch their scan findings.
+/// Collects failures and returns error if any repository fails (partial failure tracking for CI).
 async fn list_all_repositories(
-    client: &aws_sdk_ecr::Client, // Client for interacting with AWS ECR
+    client: &aws_sdk_ecr::Client,
     scan_type: &ScanType,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Result indicating success or failure with an error type
-    // List all repositories
     let response = match client.describe_repositories().send().await {
-        Ok(response) => response, // If successful, store the response
+        Ok(response) => response,
         Err(e) => {
             eprintln!("Error describing repositories: {}", e);
-            return Err(e.into()); // Convert the error to a boxed trait object and return it
+            return Err(e.into());
         }
     };
 
-    // Iterate through each repository
-    for repo in response.repositories.unwrap_or_default() {
-        // Extract the repository name
-        let repository_name = match repo.repository_name {
-            Some(name) => name.to_string(), // If found, convert it to a String
-            None => {
-                eprintln!("Repository name not found");
-                continue; // Continue to the next repository if name is not found
-            }
-        };
+    // Track success/failure for partial failure reporting (CI monitoring).
+    let mut succeeded = 0;
+    let mut failed = 0;
+    let mut failed_repos = Vec::new();
 
-        // List images in the current repository
-        match list_images_in_repository(client, &repository_name, scan_type).await {
-            Ok(_) => {} // No need to do anything if successful
-            Err(e) => {
-                eprintln!(
-                    "Error listing images for repository '{}': {}",
-                    repository_name, e
-                );
-                return Err(e.into()); // Convert the error to a boxed trait object and return it
-            }
+    for repo in response.repositories.unwrap_or_default() {
+        let repository_name = repo.repository_name.unwrap_or_else(|| {
+            eprintln!("Repository name not found, skipping");
+            String::new()
+        });
+
+        if repository_name.is_empty() {
+            continue;
         }
+
+        // Process each repository; record failures but continue scanning others.
+        if let Err(e) = list_images_in_repository(client, &repository_name, scan_type).await {
+            eprintln!("ERROR: Repository '{}': {}", repository_name, e);
+            failed_repos.push(repository_name);
+            failed += 1;
+        } else {
+            succeeded += 1;
+        }
+    }
+
+    // Return error if any repo failed; CI/monitoring can detect partial failures.
+    if failed > 0 {
+        eprintln!(
+            "WARNING: {} of {} repositories failed to scan: {}",
+            failed,
+            succeeded + failed,
+            failed_repos.join(", ")
+        );
+        return Err(format!("Partial failure: {} repositories skipped", failed).into());
     }
 
     Ok(())
 }
 
-// Function to list images in a repository
+/// Fetch and output scan findings for all images in a single repository.
+/// Routes to Basic or Enhanced scan handler based on ScanType.
+/// Basic: uses cached image_scan_findings_summary (fast, synchronous).
+/// Enhanced: calls describe_image_scan_findings() concurrently for detailed data.
 async fn list_images_in_repository(
-    client: &aws_sdk_ecr::Client, // Client for interacting with AWS ECR
-    repository_name: &str,        // Name of the repository to list images from
+    client: &aws_sdk_ecr::Client,
+    repository_name: &str,
     scan_type: &ScanType,
 ) -> Result<(), aws_sdk_ecr::Error> {
-    // Result indicating success or failure with the AWS ECR error type
-    // Create a request to describe images in the repository
-    let request = client.describe_images().repository_name(repository_name);
-    // Send the request and await the response, handling any potential errors
-    let response = request.send().await?;
-    // Default date to use if specific dates are not available
-    let default_date = DateTime::from_secs(0);
+    // Only Docker and OCI image manifests are supported; other formats are skipped with a warning.
+    const SUPPORTED_MEDIA_TYPES: &[&str] = &[
+        "application/vnd.docker.container.image.v1+json",
+        "application/vnd.oci.image.manifest.v1+json",
+    ];
 
-    // Iterate through each image detail in the response
-    for image_detail in response.image_details.unwrap_or_default() {
-        if let Some(media_type) = image_detail.artifact_media_type {
-            // Check if the image is in the expected format
-            if media_type == "application/vnd.docker.container.image.v1+json" {
-                // Extract necessary information about the image
-                let repository_name = image_detail.repository_name.unwrap_or_default();
+    let response = client
+        .describe_images()
+        .repository_name(repository_name)
+        .send()
+        .await?;
+
+    let image_details = response.image_details.unwrap_or_default();
+
+    if image_details.is_empty() {
+        return Ok(());
+    }
+
+    if scan_type.as_str() == ScanType::Basic.as_str() {
+        // Basic scan: findings already cached in image_scan_findings_summary.
+        // Fast, synchronous iteration; no additional API calls needed.
+        for image_detail in image_details {
+            if let Some(media_type) = &image_detail.artifact_media_type {
+                if !SUPPORTED_MEDIA_TYPES.contains(&media_type.as_str()) {
+                    eprintln!("Unsupported image format: {}", media_type);
+                    continue;
+                }
+
+                let repo_name = image_detail.repository_name.unwrap_or_default();
                 let image_tags = image_detail.image_tags.unwrap_or_default();
                 let image_digest = image_detail.image_digest.unwrap_or_default();
-                // Print basic image information
-                print!(
-                    "{};{};{}",
-                    repository_name,
-                    image_tags.first().map_or("", |t| t.as_str()), // Use the first tag if available
-                    image_digest
-                );
-                // If registry use Basic Scan
-                if scan_type.as_str() == ScanType::Basic.as_str() {
-                    // Check if image scan findings are available
-                    if let Some(findings) = image_detail.image_scan_findings_summary {
-                        // Extract and format relevant scan and vulnerability update dates
-                        let scan_complete_date =
-                            findings.image_scan_completed_at.unwrap_or(default_date);
-                        let update_scan_date = findings
-                            .vulnerability_source_updated_at
-                            .unwrap_or(default_date);
-                        // Extract and print severity counts for different vulnerability levels
-                        let severity_map = findings.finding_severity_counts.unwrap_or_default();
-                        print_results(scan_complete_date, update_scan_date, severity_map);
-                    } else {
-                        // If no scan findings are available, print placeholders for severity counts
-                        println!(";;;0;0;0;0;0;0");
-                    }
-                } else {
-                    // Enhanced scan
-                    // Create image identifier based on image digest
-                    let image_identifier = ImageIdentifierBuilder::default()
-                        .image_digest(image_digest)
-                        .build();
-                    // Request image findings for image digest
-                    let request_scan = client
-                        .describe_image_scan_findings()
-                        .registry_id(image_detail.registry_id.unwrap())
-                        .repository_name(repository_name)
-                        .image_id(image_identifier);
-                    // Send the request and await the response, handling any potential errors
-                    let response_scan = request_scan.send().await?;
+                let tags_str = image_tags.join(",");
 
-                    if let Some(findings) = response_scan.image_scan_findings {
-                        // Extract and print severity counts for different vulnerability levels
-                        let severity_map = findings.finding_severity_counts.unwrap_or_default();
-                        let scan_complete_date =
-                            findings.image_scan_completed_at.unwrap_or(default_date);
-                        let update_scan_date = findings
-                            .vulnerability_source_updated_at
-                            .unwrap_or(default_date);
-                        // Print results
-                        print_results(scan_complete_date, update_scan_date, severity_map)
+                if let Some(findings) = image_detail.image_scan_findings_summary {
+                    let scan_complete_date = findings.image_scan_completed_at;
+                    let update_scan_date = findings.vulnerability_source_updated_at;
+                    let severity_map = findings.finding_severity_counts.unwrap_or_default();
+                    print_csv_row(
+                        &repo_name,
+                        &tags_str,
+                        &image_digest,
+                        scan_complete_date,
+                        update_scan_date,
+                        &severity_map,
+                        false,
+                    );
+                } else {
+                    print_csv_row(
+                        &repo_name,
+                        &tags_str,
+                        &image_digest,
+                        None,
+                        None,
+                        &HashMap::new(),
+                        false,
+                    );
+                }
+            }
+        }
+    } else {
+        // Enhanced scan: must call describe_image_scan_findings() per image for detailed data.
+        // Concurrent approach: build futures for all images, then join_all() to parallelize.
+        // Build async tasks for each image's scan findings fetch.
+        // filter_map skips unsupported formats; each Some(async move {...}) captures required data.
+        let futures: Vec<_> = image_details
+            .iter()
+            .filter_map(|image_detail| {
+                let media_type = image_detail.artifact_media_type.as_ref()?;
+                if !SUPPORTED_MEDIA_TYPES.contains(&media_type.as_str()) {
+                    eprintln!("Unsupported image format: {}", media_type);
+                    return None;
+                }
+
+                let registry_id = image_detail.registry_id.clone()?;
+                let repo_name = image_detail.repository_name.clone()?;
+                let image_digest = image_detail.image_digest.clone()?;
+
+                // Clone client for concurrent task; AWS SDK clients are cheaply cloneable.
+                let client = client.clone();
+                Some(async move {
+                    let image_identifier = ImageIdentifierBuilder::default()
+                        .image_digest(&image_digest)
+                        .build();
+
+                    let result = client
+                        .describe_image_scan_findings()
+                        .registry_id(registry_id)
+                        .repository_name(&repo_name)
+                        .image_id(image_identifier)
+                        .send()
+                        .await;
+
+                    (repo_name, image_digest, result)
+                })
+            })
+            .collect();
+
+        // Concurrent await: all image scans run in parallel; bottleneck is slowest API call.
+        let results = join_all(futures).await;
+
+        // Zip original image_details with concurrent results; preserves ordering for CSV output.
+        // On error, sets error_marker=true (prints -1 in critical column for visibility).
+        for image_detail in image_details.iter().zip(results.iter()) {
+            let (detail, (repo_name, image_digest, result)) = (image_detail.0, image_detail.1);
+            let image_tags = detail.image_tags.as_deref().unwrap_or_default();
+            let tags_str = image_tags.join(",");
+
+            match result {
+                Ok(response) => {
+                    if let Some(findings) = &response.image_scan_findings {
+                        let severity_map =
+                            findings.finding_severity_counts.clone().unwrap_or_default();
+                        let scan_complete_date = findings.image_scan_completed_at;
+                        let update_scan_date = findings.vulnerability_source_updated_at;
+                        print_csv_row(
+                            repo_name,
+                            &tags_str,
+                            image_digest,
+                            scan_complete_date,
+                            update_scan_date,
+                            &severity_map,
+                            false,
+                        );
                     } else {
-                        // If no scan findings are available, print placeholders for severity counts
-                        println!(";;;0;0;0;0;0;0");
+                        print_csv_row(
+                            repo_name,
+                            &tags_str,
+                            image_digest,
+                            None,
+                            None,
+                            &HashMap::new(),
+                            false,
+                        );
                     }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Error fetching scan findings for image {}: {}",
+                        image_digest, e
+                    );
+                    // Partial failure: print row with critical=-1 (error marker for monitoring).
+                    print_csv_row(
+                        repo_name,
+                        &tags_str,
+                        image_digest,
+                        None,
+                        None,
+                        &HashMap::new(),
+                        true,
+                    );
                 }
             }
         }
@@ -128,41 +225,91 @@ async fn list_images_in_repository(
     Ok(())
 }
 
-// Print severity and dates in csv line
-fn print_results(
-    scan_complete_date: DateTime,
-    update_scan_date: DateTime,
-    severity_map: std::collections::HashMap<FindingSeverity, i32>,
-) {
-    println!(
-        ";{};{};{};{};{};{};{};{}",
-        scan_complete_date
-            .fmt(DateTimeFormat::DateTime)
-            .unwrap_or_default(),
-        update_scan_date
-            .fmt(DateTimeFormat::DateTime)
-            .unwrap_or_default(),
-        severity_map.get(&FindingSeverity::Critical).unwrap_or(&0),
-        severity_map.get(&FindingSeverity::High).unwrap_or(&0),
-        severity_map.get(&FindingSeverity::Medium).unwrap_or(&0),
-        severity_map.get(&FindingSeverity::Low).unwrap_or(&0),
-        severity_map
+/// Extract vulnerability counts by severity level from the findings map.
+/// Returns tuple: (critical, high, medium, low, informational, undefined).
+/// Missing severities default to 0 (no findings at that level).
+fn get_severity_counts(
+    severity_map: &HashMap<FindingSeverity, i32>,
+) -> (i32, i32, i32, i32, i32, i32) {
+    (
+        *severity_map.get(&FindingSeverity::Critical).unwrap_or(&0),
+        *severity_map.get(&FindingSeverity::High).unwrap_or(&0),
+        *severity_map.get(&FindingSeverity::Medium).unwrap_or(&0),
+        *severity_map.get(&FindingSeverity::Low).unwrap_or(&0),
+        *severity_map
             .get(&FindingSeverity::Informational)
             .unwrap_or(&0),
-        severity_map.get(&FindingSeverity::Undefined).unwrap_or(&0)
+        *severity_map.get(&FindingSeverity::Undefined).unwrap_or(&0),
+    )
+}
+
+/// Escape CSV field for RFC 4180 compliance: quote if contains comma/quote/newline, escape quotes as "".
+fn escape_csv_field(field: &str) -> String {
+    if field.contains(',') || field.contains('"') || field.contains('\n') {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
+}
+
+/// Format and print a single CSV row for one image's scan findings.
+/// If error_marker=true, sets critical=-1 to flag partial failures in Enhanced scan.
+/// Timestamps are formatted as ISO DateTime if present, otherwise empty.
+fn print_csv_row(
+    repo_name: &str,
+    tags: &str,
+    digest: &str,
+    scan_complete_date: Option<DateTime>,
+    update_scan_date: Option<DateTime>,
+    severity_map: &HashMap<FindingSeverity, i32>,
+    error_marker: bool,
+) {
+    let scan_date_str = scan_complete_date
+        .and_then(|d| d.fmt(DateTimeFormat::DateTime).ok())
+        .unwrap_or_default();
+    let update_date_str = update_scan_date
+        .and_then(|d| d.fmt(DateTimeFormat::DateTime).ok())
+        .unwrap_or_default();
+
+    let (critical, high, medium, low, informational, undefined) = get_severity_counts(severity_map);
+    // Mark errors with -1 in critical column for easy identification in CSV output/monitoring.
+    let critical = if error_marker { -1 } else { critical };
+
+    let escaped_repo = escape_csv_field(repo_name);
+    let escaped_tags = escape_csv_field(tags);
+    let escaped_digest = escape_csv_field(digest);
+    let escaped_scan_date = escape_csv_field(&scan_date_str);
+    let escaped_update_date = escape_csv_field(&update_date_str);
+
+    println!(
+        "{},{},{},{},{},{},{},{},{},{},{}",
+        escaped_repo,
+        escaped_tags,
+        escaped_digest,
+        escaped_scan_date,
+        escaped_update_date,
+        critical,
+        high,
+        medium,
+        low,
+        informational,
+        undefined
     );
 }
 
+/// Main entry: load AWS config, parse CLI args (--all, --version, --scan-type), determine scan mode.
+/// Outputs CSV to stdout; errors/warnings to stderr.
+/// AWS_PROFILE env var controls credential source.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Set up AWS credentials and region
+    // Load AWS credentials from environment (AWS_PROFILE env var, ~/.aws/credentials, etc.).
     let config = aws_config::load_from_env().await;
     let client = Client::new(&config);
 
-    // Retrieve command-line arguments
+    // Parse command-line arguments.
     let args: Vec<String> = env::args().collect();
 
-    // Check version
+    // Handle --version flag.
     let process_version = args.contains(&String::from("--version"));
     if process_version {
         let version = option_env!("CARGO_PKG_VERSION").unwrap_or("unknown");
@@ -170,51 +317,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Check if the user wants to process all repositories
     let process_all = args.contains(&String::from("--all"));
+    let force_basic = args.contains(&String::from("--scan-type=basic"));
+    let force_enhanced = args.contains(&String::from("--scan-type=enhanced"));
 
-    // Check if repository name argument is provided
+    if force_basic && force_enhanced {
+        eprintln!("ERROR: Cannot specify both --scan-type=basic and --scan-type=enhanced");
+        return Err("Invalid scan type arguments".into());
+    }
+
+    // Determine target: single repo (args[1]) or all repos (--all).
     let repository_name = if process_all {
         None
     } else if args.len() < 2 {
-        eprintln!("Usage: {} [--all | <repository_name> | --version]", args[0]);
+        eprintln!(
+            "Usage: {} [--all | <repository_name> | --version] [--scan-type=auto|basic|enhanced]",
+            args[0]
+        );
         return Ok(());
     } else {
         Some(&args[1])
     };
 
-    // Print headers
+    // Output CSV header to stdout.
     println!(
-        "repository_name;image_tags;image_digest;image_scan_completed_date;vulnerability_source_updated_date;Critical;High;Medium;Low;Informational;Undefined"
+        "repository_name,image_tags,image_digest,image_scan_completed_date,vulnerability_source_updated_date,Critical,High,Medium,Low,Informational,Undefined"
     );
 
-    // Get ECR Scan type
-    // Create a request to describe images in the repository
-    let request = client.get_registry_scanning_configuration();
-    // Send the request and await the response, handling any potential errors
-    let response = request.send().await?;
-    // Get Scan type from registry config
-    let binding = response.scanning_configuration.unwrap();
-    let scan_type = binding.scan_type().unwrap();
+    // Determine scan type: explicit flag > registry config (auto-detect) > Basic default.
+    let scan_type = if force_basic {
+        eprintln!("INFO: Forcing Basic scan type");
+        ScanType::Basic
+    } else if force_enhanced {
+        eprintln!("INFO: Forcing Enhanced scan type");
+        ScanType::Enhanced
+    } else {
+        // Auto-detect from registry config; fallback to Basic if unconfigured.
+        let response = client.get_registry_scanning_configuration().send().await?;
+        response
+            .scanning_configuration
+            .and_then(|config| config.scan_type().cloned())
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "WARNING: No registry scanning configuration found, defaulting to Basic scan"
+                );
+                ScanType::Basic
+            })
+    };
 
-    // Check if a repository name is provided and list images in that repository
+    // Route to single-repo or all-repos handler.
     if let Some(repo) = repository_name {
-        match list_images_in_repository(&client, repo, scan_type).await {
-            Ok(_) => {} // No need to do anything if successful
+        match list_images_in_repository(&client, repo, &scan_type).await {
+            Ok(_) => {}
             Err(e) => {
                 eprintln!("Error listing images for repository '{}': {}", repo, e);
-                return Err(e.into()); // Convert the error to a boxed trait object and return it
+                return Err(e.into());
             }
         }
     } else {
-        // If no repository name is provided, list all repositories
-        match list_all_repositories(&client, scan_type).await {
-            Ok(_) => {} // No need to do anything if successful
-            Err(e) => {
-                eprintln!("Error listing all repositories: {}", e);
-                return Err(e); // Return the error as is
-            }
-        }
+        list_all_repositories(&client, &scan_type).await?;
     }
 
     Ok(())
